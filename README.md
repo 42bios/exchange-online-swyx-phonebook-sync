@@ -50,26 +50,6 @@ Only Swyx entries containing the configured marker are managed by the script. Th
 6. Adjust the configuration block in `Sync-ExchangeToSwyx.ps1`.
 7. Run the script manually before scheduling it.
 
-## Configuration
-
-The main settings are:
-
-- `$Marker`
-- `$LogBasePath`
-- `$LogRetentionDays`
-- `$AddDefaultCountryCodeToLocalNumbers`
-- `$DefaultCountryCode`
-
-Example:
-
-```powershell
-$Marker = "[EXO-SYNC]"
-$LogBasePath = "C:\System\Swyxware\Scripts\Logs\SwyxSync.log"
-$LogRetentionDays = 2
-$AddDefaultCountryCodeToLocalNumbers = $false
-$DefaultCountryCode = "39"
-```
-
 ## Usage
 
 Run the sync manually:
@@ -84,60 +64,15 @@ Run a dry-run:
 powershell.exe -ExecutionPolicy Bypass -NoProfile -File .\Sync-ExchangeToSwyx.ps1 -WhatIf
 ```
 
-## Task Scheduler
+## Setup guide
 
-The repository includes an anonymized sample definition in `Exchange-Swyx-Phonebook-Sync.sample.xml`.
-
-Typical setup:
-
-- run whether user is logged on or not
-- run with highest privileges
-- trigger daily at `06:00`
-- optionally repeat every `4 hours`
-
-Action:
-
-```powershell
--ExecutionPolicy Bypass -NoProfile -File "C:\Scripts\Sync-ExchangeToSwyx.ps1"
-```
-
-## Authentication notes
-
-Example Exchange Online app-only login:
-
-```powershell
-Connect-ExchangeOnline `
-  -AppId "<APP_ID>" `
-  -CertificateThumbprint "<THUMBPRINT>" `
-  -Organization "<tenant>.onmicrosoft.com"
-```
-
-Example Swyx test:
-
-```powershell
-Connect-IpPbx
-Get-IpPbxPhonebookEntry -GlobalPhoneBook
-```
-
-## Matching behavior
-
-- matching is currently based on `Name`
-- mobile numbers are created as separate entries with the suffix `(Mobil)`
-- only entries containing the configured marker are modified or removed
-
-For larger environments with ambiguous display names, GUID-based matching may be a useful future improvement.
-
-## Example number format
-
-```text
-+390000000001
-+490000000001
-```
+The full setup and scheduling notes are in [`docs/SETUP.md`](docs/SETUP.md).
 
 ## Repository contents
 
 - `Sync-ExchangeToSwyx.ps1`
 - `Exchange-Swyx-Phonebook-Sync.sample.xml`
+- `docs/SETUP.md`
 - `LICENSE`
 
 ## Security notes
@@ -149,7 +84,3 @@ For larger environments with ambiguous display names, GUID-based matching may be
 ## License
 
 This project is released under the MIT License. See `LICENSE`.
-
-## Author
-
-Manuel J. Mahr
