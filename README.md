@@ -172,8 +172,8 @@ $DefaultCountryCode = "39"
 The script is intended to store numbers in E.164-style format, for example:
 
 ```text
-+393408408804
-+490123456789
++390000000001
++490000000001
 ```
 
 ## Usage
