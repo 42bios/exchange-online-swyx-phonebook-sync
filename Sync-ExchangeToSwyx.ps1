@@ -3,11 +3,15 @@
 Synchronizes Exchange Online mail contacts into the global Swyx phonebook.
 
 .DESCRIPTION
-Reads mail contacts from Exchange, normalizes their phone numbers, and creates,
-updates, or removes the Swyx phonebook entries managed by this script.
+Reads Exchange Online MailContacts, normalizes phone numbers, and synchronizes
+them into the Swyx global phonebook using Swyx PowerShell cmdlets.
+
+Display name format:
+John Doe | Example Company
+John Doe | Example Company (Mobile)
 
 .PARAMETER WhatIf
-Runs the synchronization in dry-run mode without changing any Swyx entries.
+Runs the synchronization in dry-run mode without changing Swyx entries.
 
 .EXAMPLE
 powershell.exe -ExecutionPolicy Bypass -NoProfile -File .\Sync-ExchangeToSwyx.ps1
@@ -16,7 +20,6 @@ powershell.exe -ExecutionPolicy Bypass -NoProfile -File .\Sync-ExchangeToSwyx.ps
 powershell.exe -ExecutionPolicy Bypass -NoProfile -File .\Sync-ExchangeToSwyx.ps1 -WhatIf
 
 .NOTES
-Author: Manuel J. Mahr
 Project: Exchange Online to Swyx Phonebook Sync
 License: MIT
 #>
@@ -31,23 +34,35 @@ $ErrorActionPreference = "Stop"
 # =========================
 # CONFIGURATION
 # =========================
-$Marker = "[EXO-SYNC]"
-$LogBasePath = "C:\System\Swyxware\Scripts\Logs\SwyxSync.log"
-$LogRetentionDays = 2
+
+# Exchange Online App-Only Authentication
+$AppId = "<APP_ID>"
+$CertificateThumbprint = "<CERTIFICATE_THUMBPRINT>"
+$Organization = "<TENANT>.onmicrosoft.com"
+
+# Paths
+$BaseDirectory = "C:\System\Swyxware\Scripts"
+$LogDirectory = Join-Path $BaseDirectory "Logs"
+$StateFilePath = Join-Path $BaseDirectory "SwyxSyncState.json"
+
+# Logging
+$LogRetentionDays = 30
+$Today = Get-Date -Format "yyyy-MM-dd"
+$LogFile = Join-Path $LogDirectory "Sync-ExchangeToSwyx-$Today.log"
+
+# Phone number normalization
 $AddDefaultCountryCodeToLocalNumbers = $false
 $DefaultCountryCode = "39"
+
+# Display labels
+$MobileSuffix = "(Mobil)"
 
 # =========================
 # LOGGING
 # =========================
-$logDirectory = Split-Path -Path $LogBasePath -Parent
-$logFileName = [System.IO.Path]::GetFileNameWithoutExtension($LogBasePath)
-$logExtension = [System.IO.Path]::GetExtension($LogBasePath)
-$today = Get-Date -Format "yyyy-MM-dd"
-$LogFile = Join-Path $logDirectory "$logFileName`_$today$logExtension"
 
-if (-not (Test-Path -Path $logDirectory)) {
-    New-Item -Path $logDirectory -ItemType Directory -Force | Out-Null
+if (-not (Test-Path -Path $LogDirectory)) {
+    New-Item -Path $LogDirectory -ItemType Directory -Force | Out-Null
 }
 
 function Write-Log {
@@ -64,21 +79,38 @@ function Write-Log {
 }
 
 function Remove-ExpiredLogs {
-    Get-ChildItem -Path $logDirectory -Filter "$logFileName*_*.log" -File -ErrorAction SilentlyContinue |
-        Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-$LogRetentionDays) } |
-        ForEach-Object {
-            try {
-                Remove-Item -Path $_.FullName -Force
-                Write-Log "Deleted old log file: $($_.Name)"
-            }
-            catch {
-                Write-Log "Failed to delete old log file: $($_.Name)"
-            }
+    Get-ChildItem `
+        -Path $LogDirectory `
+        -Filter "Sync-ExchangeToSwyx-*.log" `
+        -File `
+        -ErrorAction SilentlyContinue |
+    Where-Object {
+        $_.LastWriteTime -lt (Get-Date).AddDays(-$LogRetentionDays)
+    } |
+    ForEach-Object {
+        try {
+            Remove-Item -Path $_.FullName -Force
+            Write-Log "Deleted old log file: $($_.Name)"
         }
+        catch {
+            Write-Log "Failed to delete old log file: $($_.Name)"
+        }
+    }
+}
+
+# =========================
+# MODULES / VALIDATION
+# =========================
+
+function Import-RequiredModules {
+    Import-Module ExchangeOnlineManagement -ErrorAction Stop
+    Import-Module IpPbx -ErrorAction Stop
 }
 
 function Assert-RequiredCommands {
     $requiredCommands = @(
+        "Connect-ExchangeOnline",
+        "Disconnect-ExchangeOnline",
         "Get-MailContact",
         "Get-Contact",
         "Connect-IpPbx",
@@ -91,13 +123,18 @@ function Assert-RequiredCommands {
 
     foreach ($commandName in $requiredCommands) {
         if (-not (Get-Command -Name $commandName -ErrorAction SilentlyContinue)) {
-            throw "Required command '$commandName' is not available in the current session."
+            throw "Required command '$commandName' is not available."
         }
     }
 }
 
+# =========================
+# PHONE NORMALIZATION
+# =========================
+
 function Normalize-Phone {
     param(
+        [AllowNull()]
         [string]$Number
     )
 
@@ -126,6 +163,84 @@ function Normalize-Phone {
     return "+" + $normalized
 }
 
+# =========================
+# STATE FILE
+# =========================
+
+function Get-SyncState {
+    if (-not (Test-Path -Path $StateFilePath)) {
+        return @()
+    }
+
+    try {
+        $rawState = Get-Content -Path $StateFilePath -Raw
+
+        if ([string]::IsNullOrWhiteSpace($rawState)) {
+            return @()
+        }
+
+        $state = $rawState | ConvertFrom-Json
+
+        if ($null -eq $state) {
+            return @()
+        }
+
+        return @($state)
+    }
+    catch {
+        Write-Log "Failed to read sync state file. Starting with empty state."
+        return @()
+    }
+}
+
+function Save-SyncState {
+    param(
+        [Parameter(Mandatory = $true)]
+        [array]$Entries
+    )
+
+    if (-not (Test-Path -Path $BaseDirectory)) {
+        New-Item -Path $BaseDirectory -ItemType Directory -Force | Out-Null
+    }
+
+    @($Entries) |
+        Select-Object Name, Number |
+        ConvertTo-Json -Depth 5 |
+        Set-Content -Path $StateFilePath -Encoding UTF8
+}
+
+# =========================
+# EXCHANGE ONLINE
+# =========================
+
+function Connect-Exchange {
+    Write-Log "Connecting to Exchange Online."
+
+    Connect-ExchangeOnline `
+        -AppId $AppId `
+        -CertificateThumbprint $CertificateThumbprint `
+        -Organization $Organization `
+        -ShowBanner:$false | Out-Null
+
+    Write-Log "Connected to Exchange Online."
+}
+
+function Get-SwyxDisplayName {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$DisplayName,
+
+        [AllowNull()]
+        [string]$Company
+    )
+
+    if (-not [string]::IsNullOrWhiteSpace($Company)) {
+        return "$DisplayName | $Company"
+    }
+
+    return $DisplayName
+}
+
 function Get-DesiredSwyxEntriesFromExchange {
     Write-Log "Loading Exchange mail contacts."
 
@@ -136,78 +251,101 @@ function Get-DesiredSwyxEntriesFromExchange {
         try {
             $contact = Get-Contact -Identity $mailContact.Identity
 
-            $displayName = $contact.DisplayName
-            $company = $contact.Company
-            $email = [string]$mailContact.PrimarySmtpAddress
-            $description = "$company | $email | $Marker"
+            $baseName = Get-SwyxDisplayName `
+                -DisplayName $contact.DisplayName `
+                -Company $contact.Company
 
             $phone = Normalize-Phone -Number $contact.Phone
             $mobile = Normalize-Phone -Number $contact.MobilePhone
 
             if ($phone) {
                 $desiredEntries.Add([pscustomobject]@{
-                    Name        = $displayName
+                    Name        = $baseName
                     Number      = $phone
-                    Description = $description
+                    Description = ""
                 })
             }
 
             if ($mobile) {
                 $desiredEntries.Add([pscustomobject]@{
-                    Name        = "$displayName (Mobil)"
+                    Name        = "$baseName $MobileSuffix"
                     Number      = $mobile
-                    Description = $description
+                    Description = ""
                 })
             }
         }
         catch {
-            Write-Log "Failed to read contact '$($mailContact.DisplayName)': $($_.Exception.Message)"
+            Write-Log "Failed to process contact '$($mailContact.DisplayName)': $($_.Exception.Message)"
         }
     }
 
-    $deduplicatedEntries = $desiredEntries | Sort-Object Name, Number, Description -Unique
-    Write-Log "Collected $($deduplicatedEntries.Count) desired Swyx entries from Exchange."
+    $deduplicatedEntries = $desiredEntries |
+        Sort-Object Name, Number, Description -Unique
+
+    Write-Log "Collected $($deduplicatedEntries.Count) desired Swyx entries."
 
     return @($deduplicatedEntries)
 }
 
-function Get-ManagedSwyxEntries {
+# =========================
+# SWYX
+# =========================
+
+function Connect-Swyx {
     Write-Log "Connecting to Swyx."
     Connect-IpPbx
     Write-Log "Connected to Swyx."
-
-    $existingEntries = Get-IpPbxPhonebookEntry -GlobalPhoneBook |
-        Where-Object { $_.Description -like "*$Marker*" }
-
-    Write-Log "Found $($existingEntries.Count) managed Swyx entries."
-    return @($existingEntries)
 }
+
+function Get-SwyxEntriesByName {
+    $entries = Get-IpPbxPhonebookEntry -GlobalPhoneBook
+    $entriesByName = @{}
+
+    foreach ($entry in $entries) {
+        if (-not $entriesByName.ContainsKey($entry.Name)) {
+            $entriesByName[$entry.Name] = @()
+        }
+
+        $entriesByName[$entry.Name] += $entry
+    }
+
+    return $entriesByName
+}
+
+# =========================
+# SYNC ENGINE
+# =========================
 
 function Sync-SwyxPhonebook {
     param(
-        [Parameter(Mandatory = $true)]
-        [array]$DesiredEntries,
-
-        [Parameter(Mandatory = $true)]
-        [array]$ExistingEntries,
-
+        [array]$DesiredEntries = @(),
+        [array]$PreviousStateEntries = @(),
         [switch]$WhatIf
     )
 
-    $existingByName = @{}
-    foreach ($entry in $ExistingEntries) {
-        $existingByName[$entry.Name] = $entry
+    $existingByName = Get-SwyxEntriesByName
+
+    $desiredByName = @{}
+    foreach ($desired in @($DesiredEntries)) {
+        $desiredByName[$desired.Name] = $desired
     }
 
-    foreach ($desired in $DesiredEntries) {
-        if (-not $existingByName.ContainsKey($desired.Name)) {
+    # ADD / UPDATE
+    foreach ($desired in @($DesiredEntries)) {
+        $existingEntry = $null
+
+        if ($existingByName.ContainsKey($desired.Name)) {
+            $existingEntry = @($existingByName[$desired.Name])[0]
+        }
+
+        if (-not $existingEntry) {
             Write-Log "ADD: $($desired.Name) -> $($desired.Number)"
 
             if (-not $WhatIf) {
                 $newEntry = New-IpPbxPhonebookEntry `
                     -Name $desired.Name `
                     -Number $desired.Number `
-                    -Description $desired.Description `
+                    -Description "" `
                     -GlobalPhoneBook
 
                 Add-IpPbxPhoneBookEntry -PhoneBookEntry $newEntry
@@ -216,16 +354,15 @@ function Sync-SwyxPhonebook {
             continue
         }
 
-        $existing = $existingByName[$desired.Name]
         $needsUpdate = $false
 
-        if ([string]$existing.Number -ne [string]$desired.Number) {
-            $existing.Number = $desired.Number
+        if ([string]$existingEntry.Number -ne [string]$desired.Number) {
+            $existingEntry.Number = $desired.Number
             $needsUpdate = $true
         }
 
-        if ([string]$existing.Description -ne [string]$desired.Description) {
-            $existing.Description = $desired.Description
+        if ([string]$existingEntry.Description -ne "") {
+            $existingEntry.Description = ""
             $needsUpdate = $true
         }
 
@@ -233,41 +370,82 @@ function Sync-SwyxPhonebook {
             Write-Log "UPDATE: $($desired.Name) -> $($desired.Number)"
 
             if (-not $WhatIf) {
-                Update-IpPbxPhonebookEntry -PhoneBookEntry $existing
+                Update-IpPbxPhonebookEntry -PhoneBookEntry $existingEntry
             }
         }
     }
 
-    $desiredNames = @($DesiredEntries.Name)
+    # REMOVE
+    # Only remove entries that were previously created by this sync.
+    foreach ($previousEntry in @($PreviousStateEntries)) {
+        if ($desiredByName.ContainsKey($previousEntry.Name)) {
+            continue
+        }
 
-    foreach ($existing in $ExistingEntries) {
-        if ($desiredNames -notcontains $existing.Name) {
-            Write-Log "REMOVE: $($existing.Name) -> $($existing.Number)"
+        if (-not $existingByName.ContainsKey($previousEntry.Name)) {
+            continue
+        }
+
+        $entriesToRemove = @($existingByName[$previousEntry.Name]) |
+            Where-Object {
+                [string]$_.Number -eq [string]$previousEntry.Number
+            }
+
+        foreach ($entryToRemove in $entriesToRemove) {
+            Write-Log "REMOVE: $($entryToRemove.Name) -> $($entryToRemove.Number)"
 
             if (-not $WhatIf) {
-                Remove-IpPbxPhoneBookEntry -PhoneBookEntry $existing -Confirm:$false
+                Remove-IpPbxPhoneBookEntry `
+                    -PhoneBookEntry $entryToRemove `
+                    -Confirm:$false
             }
         }
     }
 }
 
+# =========================
+# MAIN
+# =========================
+
 try {
     Remove-ExpiredLogs
-    Assert-RequiredCommands
 
     Write-Log "=== Sync started ==="
+    Write-Log "Running as: $([System.Security.Principal.WindowsIdentity]::GetCurrent().Name)"
 
-    $desiredEntries = Get-DesiredSwyxEntriesFromExchange
-    $existingEntries = Get-ManagedSwyxEntries
+    Import-RequiredModules
+    Connect-Exchange
+
+    # Get-MailContact and Get-Contact are loaded after Connect-ExchangeOnline.
+    Assert-RequiredCommands
+
+    $previousStateEntries = @(Get-SyncState)
+    $desiredEntries = @(Get-DesiredSwyxEntriesFromExchange)
+
+    Connect-Swyx
 
     Sync-SwyxPhonebook `
         -DesiredEntries $desiredEntries `
-        -ExistingEntries $existingEntries `
+        -PreviousStateEntries $previousStateEntries `
         -WhatIf:$WhatIf
+
+    if (-not $WhatIf) {
+        Save-SyncState -Entries $desiredEntries
+    }
 
     Write-Log "=== Sync completed ==="
 }
 catch {
     Write-Log "FATAL ERROR: $($_.Exception.Message)"
     throw
+}
+finally {
+    try {
+        Disconnect-ExchangeOnline `
+            -Confirm:$false `
+            -ErrorAction SilentlyContinue | Out-Null
+    }
+    catch {
+        # Ignore disconnect errors.
+    }
 }
